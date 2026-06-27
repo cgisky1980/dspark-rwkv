@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# uv
+.uv-cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# 大文件（不进 git，见 README 下载说明）
+weights/*.pth
+data/*.pt
+data/*.pth
+
+# 日志
+*.log
+wandb/
+runs/
+
+# 临时
+*.tmp
+*.bak

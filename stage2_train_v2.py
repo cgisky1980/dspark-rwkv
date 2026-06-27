@@ -1,0 +1,337 @@
+"""DSpark → RWKV 复现 · 阶段2v2 优化版
+
+优化点（基于阶段2v1报告的改进方向）：
+1. cross-attn 看多位置 context hidden（anchor 之前 CTX 个位置的 target hidden）
+   - v1 只看 anchor 单位置，信息量有限
+   - v2 K/V = anchor 之前 CTX=8 个位置的 target hidden 序列
+2. 加置信度头训练 + BCE loss
+   - 置信度标签 = 累积接受率（1 if 该位置及之前全对，else 0 的简化版）
+   - 实际用 argmax 是否正确作为标签
+3. 增加训练步数到 3000，加 warmup
+4. block_size 试 4 和 6
+5. 加梯度裁剪
+"""
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pathlib import Path
+
+torch.manual_seed(42)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DATA_PATH = Path(__file__).parent / "data" / "stage2_train.pt"
+
+VOCAB = 65536
+D_TARGET = 768
+N_TARGET_LAYERS = 3
+D_DRAFT = 256
+N_DRAFT_LAYERS = 2
+BLOCK = 4
+CTX = 8            # cross-attn 看 anchor 之前 CTX 个位置
+N_HEADS = 8
+LR = 1e-4
+N_STEPS = 3000
+WARMUP = 200
+BS = 64
+SQRT_E = math.sqrt(math.e)
+
+
+def load_data():
+    d = torch.load(DATA_PATH, map_location="cpu", weights_only=True)
+    tokens = d["tokens"]          # [N, T+1]
+    # 3 层 hidden 拼接存
+    hids = {l: d[f"hidden_{l}"] for l in [0, 6, 11]}
+    return tokens, hids
+
+
+# ---------- 并行主干 ----------
+class CrossAttnLayer(nn.Module):
+    def __init__(self, d, n_heads):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d)
+        self.self_attn = nn.MultiheadAttention(d, n_heads, batch_first=True)
+        self.ln2 = nn.LayerNorm(d)
+        self.cross_attn = nn.MultiheadAttention(d, n_heads, batch_first=True)
+        self.ln3 = nn.LayerNorm(d)
+        self.ffn = nn.Sequential(nn.Linear(d, d * 4), nn.GELU(), nn.Linear(d * 4, d))
+
+    def forward(self, x, ctx_kv):
+        # x: [B, T, d]（block 内），ctx_kv: [B, CTX, d]（context 的 K/V）
+        h = self.ln1(x)
+        a, _ = self.self_attn(h, h, h)
+        x = x + a
+        h = self.ln2(x)
+        a, _ = self.cross_attn(h, ctx_kv, ctx_kv)
+        x = x + a
+        h = self.ln3(x)
+        x = x + self.ffn(h)
+        return x
+
+
+class ParallelTrunk(nn.Module):
+    """并行主干 v2：cross-attn 看多位置 context hidden。"""
+    def __init__(self, vocab, d_draft, n_layers, n_heads, block_size, d_target, ctx):
+        super().__init__()
+        self.block_size = block_size
+        self.ctx = ctx
+        self.token_emb = nn.Embedding(vocab, d_draft)
+        self.mask_emb = nn.Parameter(torch.randn(1, 1, d_draft) * 0.02)
+        self.pos_emb = nn.Parameter(torch.randn(1, block_size, d_draft) * 0.02)
+        # context 位置编码
+        self.ctx_pos_emb = nn.Parameter(torch.randn(1, ctx, d_draft) * 0.02)
+        # target hidden 融合：每层 768 -> d_draft，3 层拼接后投影
+        self.target_fc = nn.Linear(d_target * N_TARGET_LAYERS, d_draft)
+        self.target_ln = nn.LayerNorm(d_draft)
+        self.layers = nn.ModuleList([
+            CrossAttnLayer(d_draft, n_heads) for _ in range(n_layers)
+        ])
+        self.final_ln = nn.LayerNorm(d_draft)
+        self.lm_head = nn.Linear(d_draft, vocab, bias=False)
+
+    def forward(self, anchor_token, ctx_hidden):
+        """anchor_token: [B], ctx_hidden: [B, CTX, 3*768]
+        -> base_logits [B, block, V], hidden [B, block, d]
+        """
+        B = anchor_token.shape[0]
+        anchor_emb = self.token_emb(anchor_token).unsqueeze(1)  # [B,1,d]
+        mask = self.mask_emb.expand(B, self.block_size - 1, -1)
+        x = torch.cat([anchor_emb, mask], dim=1)  # [B, block, d]
+        x = x + self.pos_emb
+        # context hidden 融合
+        ctx = self.target_fc(ctx_hidden)  # [B, CTX, d]
+        ctx = self.target_ln(ctx)
+        ctx = ctx + self.ctx_pos_emb
+        for layer in self.layers:
+            x = layer(x, ctx)
+        x = self.final_ln(x)
+        base_logits = self.lm_head(x)
+        return base_logits, x
+
+
+# ---------- 顺序头 ----------
+class GruHead(nn.Module):
+    def __init__(self, vocab, d_draft, rank=128):
+        super().__init__()
+        self.rank = rank
+        self.token_emb = nn.Embedding(vocab, rank)
+        self.joint = nn.Linear(2 * rank + d_draft, 3 * rank)
+        self.w_out = nn.Linear(rank, vocab, bias=False)
+
+    def forward_block(self, base_logits, prev_tokens, hidden):
+        B, T, V = base_logits.shape
+        prev_emb = self.token_emb(prev_tokens)
+        s = torch.zeros(B, self.rank, device=base_logits.device)
+        biases = []
+        for t in range(T):
+            z = torch.cat([s, prev_emb[:, t], hidden[:, t]], dim=-1)
+            g_raw, c_raw, o_raw = self.joint(z).chunk(3, dim=-1)
+            g = torch.sigmoid(g_raw)
+            s = g * s + (1 - g) * torch.tanh(c_raw)
+            biases.append(self.w_out(torch.tanh(o_raw)))
+        return torch.stack(biases, dim=1)
+
+
+class Rwkv7Head(nn.Module):
+    def __init__(self, vocab, d_draft, rank=128):
+        super().__init__()
+        self.rank = rank
+        self.token_emb = nn.Embedding(vocab, d_draft)
+        self.x_r = nn.Parameter(torch.zeros(d_draft))
+        self.x_w = nn.Parameter(torch.zeros(d_draft))
+        self.x_k = nn.Parameter(torch.zeros(d_draft))
+        self.x_v = nn.Parameter(torch.zeros(d_draft))
+        self.x_a = nn.Parameter(torch.zeros(d_draft))
+        self.x_g = nn.Parameter(torch.zeros(d_draft))
+        self.ln = nn.LayerNorm(d_draft)
+        self.r_proj = nn.Linear(d_draft, rank, bias=False)
+        self.k_proj = nn.Linear(d_draft, rank, bias=False)
+        self.v_proj = nn.Linear(d_draft, rank, bias=False)
+        self.w_proj = nn.Linear(d_draft, rank, bias=False)
+        self.a_proj = nn.Linear(d_draft, rank, bias=False)
+        self.w1 = nn.Linear(d_draft, rank, bias=False)
+        self.w2 = nn.Linear(rank, rank, bias=False)
+        self.a0 = nn.Parameter(torch.zeros(rank))
+        self.w0 = nn.Parameter(torch.zeros(rank))
+        self.k_k = nn.Parameter(torch.ones(rank) * 0.1)
+        self.k_a = nn.Parameter(torch.zeros(rank))
+        self.r_k = nn.Parameter(torch.ones(rank) * 0.1)
+        self.g1 = nn.Linear(d_draft, rank, bias=False)
+        self.g2 = nn.Linear(rank, rank, bias=False)
+        self.w_out = nn.Linear(rank, vocab, bias=False)
+
+    def forward_block(self, base_logits, prev_tokens, hidden):
+        B, T, V = base_logits.shape
+        prev_emb = self.token_emb(prev_tokens)
+        x = self.ln(hidden)
+        xr = x + self.x_r * (prev_emb - x)
+        xw = x + self.x_w * (prev_emb - x)
+        xk = x + self.x_k * (prev_emb - x)
+        xv = x + self.x_v * (prev_emb - x)
+        xa = x + self.x_a * (prev_emb - x)
+        xg = x + self.x_g * (prev_emb - x)
+        r = self.r_proj(xr); k = self.k_proj(xk); v = self.v_proj(xv)
+        w_raw = self.w_proj(xw) + self.w2(torch.tanh(self.w1(xw)))
+        a = torch.sigmoid(self.a0 + self.a_proj(xa))
+        g = torch.sigmoid(self.g1(xg)) @ self.g2.weight
+        S = torch.zeros(B, self.rank, self.rank, device=base_logits.device)
+        biases = []
+        eps = 1e-12
+        for t in range(T):
+            rt, kt, vt = r[:, t], k[:, t], v[:, t]
+            at = a[:, t]
+            w = torch.exp(-torch.sigmoid(self.w0 + w_raw[:, t]) / SQRT_E)
+            kk = kt * self.k_k
+            kk = kk / (kk.norm(dim=-1, keepdim=True) + eps)
+            k_mod = kt + self.k_a * (kt * at - kt)
+            S_kk = (S * kk.unsqueeze(1)).sum(dim=2)
+            S = S * w.unsqueeze(1)
+            S = S + S_kk.unsqueeze(2) * (-kk * at).unsqueeze(1)
+            S = S + vt.unsqueeze(2) * k_mod.unsqueeze(1)
+            y = (S * rt.unsqueeze(1)).sum(dim=2)
+            rkr_sum = (rt * k_mod * self.r_k).sum(dim=-1, keepdim=True)
+            y = y + rkr_sum * vt
+            biases.append(self.w_out(y * g[:, t]))
+        return torch.stack(biases, dim=1)
+
+
+# ---------- Draft 完整模型 ----------
+class DSparkDraft(nn.Module):
+    def __init__(self, head_cls):
+        super().__init__()
+        self.trunk = ParallelTrunk(VOCAB, D_DRAFT, N_DRAFT_LAYERS, N_HEADS, BLOCK, D_TARGET, CTX)
+        self.head = head_cls(VOCAB, D_DRAFT)
+        self.conf_head = nn.Linear(D_DRAFT, 1)
+
+    def forward(self, anchor_token, ctx_hidden, prev_tokens):
+        base_logits, hidden = self.trunk(anchor_token, ctx_hidden)
+        bias = self.head.forward_block(base_logits, prev_tokens, hidden)
+        draft_logits = base_logits + bias
+        conf = torch.sigmoid(self.conf_head(hidden))  # [B, block, 1]
+        return draft_logits, conf.squeeze(-1)
+
+
+# ---------- 数据采样 ----------
+def sample_batch(tokens, hids_dict, bs, block, ctx):
+    """采 anchor + context。anchor 位置 i 的 context = hids[i, i-CTX:i]
+    """
+    N, T1 = tokens.shape
+    T = T1 - 1  # hidden 只有 T 个位置
+    max_anchor = T - block  # anchor 后要有 block 个 token
+    idx = torch.randint(0, N, (bs,))
+    anc = torch.randint(ctx, max_anchor + 1, (bs,))  # 保证 anchor 前 CTX 个位置存在
+    # context hidden: [bs, CTX, 3*768]
+    ctx_list = []
+    for l in [0, 6, 11]:
+        # hids_dict[l]: [N, T, 768]
+        ctx_l = torch.stack([hids_dict[l][idx[b], anc[b]-ctx:anc[b]] for b in range(bs)], dim=0)
+        ctx_list.append(ctx_l)
+    ctx_hidden = torch.cat(ctx_list, dim=-1)  # [bs, CTX, 3*768]
+    # anchor token
+    anchor_token = tokens[idx, anc]
+    # block 内 target tokens
+    block_tokens = torch.stack([tokens[idx, anc + 1 + k] for k in range(block)], dim=1)
+    # prev tokens
+    prev = torch.zeros_like(block_tokens)
+    prev[:, 0] = anchor_token
+    prev[:, 1:] = block_tokens[:, :-1]
+    return anchor_token, ctx_hidden, prev, block_tokens
+
+
+# ---------- 训练 ----------
+def ce_loss(draft_logits, target_tokens):
+    return F.cross_entropy(draft_logits.reshape(-1, VOCAB), target_tokens.reshape(-1))
+
+
+def conf_bce_loss(conf, correct):
+    """conf: [B, block], correct: [B, block] (1 if draft argmax == target)
+    置信度标签 = 累积正确（该位置及之前全对才 1）
+    """
+    # 累积正确：位置 t 的标签 = 1 if correct[0..t] 全为 1
+    cum_correct = (correct.cumsum(dim=1) == torch.arange(1, correct.shape[1]+1, device=correct.device).unsqueeze(0)).float()
+    return F.binary_cross_entropy(conf, cum_correct)
+
+
+def lr_schedule(step, warmup, total):
+    if step < warmup:
+        return step / warmup
+    return 0.5 * (1 + math.cos(math.pi * (step - warmup) / (total - warmup)))
+
+
+def run(name, head_cls, block=BLOCK, n_steps=N_STEPS):
+    print(f"\n{'='*60}\n=== {name} (block={block}, ctx={CTX}, steps={n_steps}) ===\n{'='*60}")
+    tokens, hids_dict = load_data()
+    tokens = tokens.to(DEVICE)
+    hids_dict = {k: v.to(DEVICE) for k, v in hids_dict.items()}
+    print(f"数据: tokens={tokens.shape}")
+
+    global BLOCK_G
+    BLOCK_G = block
+    model = DSparkDraft(head_cls).to(DEVICE)
+    # 改 trunk block_size
+    model.trunk.block_size = block
+    model.trunk.pos_emb = nn.Parameter(torch.randn(1, block, D_DRAFT).to(DEVICE) * 0.02)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"参数量: {n_params/1e6:.1f}M")
+
+    for step in range(n_steps):
+        lr = LR * lr_schedule(step, WARMUP, n_steps)
+        for g in opt.param_groups:
+            g['lr'] = lr
+        anc, ch, prev, tgt = sample_batch(tokens, hids_dict, BS, block, CTX)
+        draft_logits, conf = model(anc, ch, prev)
+        loss_ce = ce_loss(draft_logits, tgt)
+        with torch.no_grad():
+            correct = (draft_logits.argmax(-1) == tgt).float()
+        loss_conf = conf_bce_loss(conf, correct)
+        loss = loss_ce + 0.5 * loss_conf
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        if (step + 1) % 150 == 0:
+            with torch.no_grad():
+                acc = (draft_logits.argmax(-1) == tgt).float()
+                pos_acc = [acc[:, t].mean().item() for t in range(block)]
+                avg_acc = acc.mean().item()
+                # 置信度校准：高置信位置的准确率
+                conf_flat = conf.mean().item()
+            print(f"  step {step+1:4d}  lr={lr:.2e}  loss={loss.item():.4f} (ce={loss_ce.item():.3f},conf={loss_conf.item():.3f})  acc={avg_acc:.3f}  conf={conf_flat:.3f}  pos={[f'{a:.2f}' for a in pos_acc]}")
+
+    # 评估
+    model.eval()
+    pos_acc = [0.0] * block
+    pos_cnt = [0] * block
+    with torch.no_grad():
+        N_eval = 512
+        for i in range(0, N_eval, BS):
+            n = min(BS, N_eval - i)
+            anc, ch, prev, tgt = sample_batch(tokens, hids_dict, n, block, CTX)
+            dl, _ = model(anc, ch, prev)
+            acc = (dl.argmax(-1) == tgt).float()
+            for t in range(block):
+                pos_acc[t] += acc[:, t].sum().item()
+                pos_cnt[t] += acc[:, t].numel()
+    pos_rate = [pos_acc[t] / max(pos_cnt[t], 1) for t in range(block)]
+    avg = sum(pos_rate) / block
+    print(f"\n  最终位置接受率: {[f'{r:.3f}' for r in pos_rate]}")
+    print(f"  平均接受率: {avg:.4f}")
+    return pos_rate, avg
+
+
+def main():
+    print(f"DEVICE={DEVICE} VOCAB={VOCAB} D_DRAFT={D_DRAFT} CTX={CTX}")
+    print(f"target: RWKV-7 0.1B, 改进: cross-attn看{CTX}位置context + 置信度BCE")
+    results = {}
+    for name, cls in [("GRU 顺序头", GruHead), ("RWKV-7 顺序头", Rwkv7Head)]:
+        torch.manual_seed(42)
+        pos_rate, avg = run(name, cls, block=BLOCK, n_steps=N_STEPS)
+        results[name] = (pos_rate, avg)
+    print(f"\n{'='*60}\n汇总 (block={BLOCK}, ctx={CTX}, steps={N_STEPS})\n{'='*60}")
+    print(f"{'头':<16} {'平均':<8} 各位置")
+    for name, (pos_rate, avg) in results.items():
+        print(f"{name:<16} {avg:.4f}   {[f'{r:.3f}' for r in pos_rate]}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+[project]
+name = "dspark-rwkv"
+version = "0.1.0"
+description = "DSpark 顺序头 RWKV-7 复现"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.48",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
