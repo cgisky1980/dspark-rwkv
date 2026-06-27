@@ -4,6 +4,8 @@
 
 This repository reproduces and adapts the [DSpark](https://github.com/deepseek-ai/DeepSpec) framework (jointly proposed by DeepSeek and Peking University) to the [RWKV-7](https://github.com/BlinkDL/RWKV-LM) linear RNN target. The original DSpark paper experiments with Transformer autoregressive targets (Qwen3 series); this work verifies its feasibility on the RWKV-7 Delta Rule architecture.
 
+**Paper**: [English](docs/paper_en.md) | [中文](docs/paper_zh.md)
+
 ## Key Results
 
 | Metric | Value |
