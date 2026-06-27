@@ -2,9 +2,11 @@
 
 > Adapting DSpark semi-autoregressive speculative decoding to RWKV-7 target, achieving **3.75x speedup** in concurrent batched inference.
 
-This repository reproduces and adapts the [DSpark](https://github.com/deepseek-ai/DeepSpec) framework (jointly proposed by DeepSeek and Peking University) to the [RWKV-7](https://github.com/BlinkDL/RWKV-LM) linear RNN target. The original DSpark paper experiments with Transformer autoregressive targets (Qwen3 series); this work verifies its feasibility on the RWKV-7 Delta Rule architecture.
+**Language**: [English](README.md) | [中文](README_zh.md)
 
 **Paper**: [English](docs/paper_en.md) | [中文](docs/paper_zh.md)
+
+This repository reproduces and adapts the [DSpark](https://github.com/deepseek-ai/DeepSpec) framework (jointly proposed by DeepSeek and Peking University) to the [RWKV-7](https://github.com/BlinkDL/RWKV-LM) linear RNN target. The original DSpark paper experiments with Transformer autoregressive targets (Qwen3 series); this work verifies its feasibility on the RWKV-7 Delta Rule architecture.
 
 ## Key Results
 
