@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "DSpark 顺序头 RWKV-7 复现"
 requires-python = ">=3.12"
 dependencies = [
+    "datasets>=5.0.0",
+    "flag-gems>=5.0.2",
+    "ninja>=1.13.0",
     "torch>=2.5",
     "transformers>=4.48",
 ]

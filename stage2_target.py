@@ -17,11 +17,11 @@ from pathlib import Path
 
 torch.manual_seed(42)
 
-WEIGHTS = Path(__file__).parent / "weights" / "rwkv7-0.1b.pth"
+WEIGHTS = Path(__file__).parent / "weights" / "rwkv7-2.9b.pth"
 HEAD_SIZE = 64
 SQRT_E = math.sqrt(math.e)
-DEVICE = "cpu"
-DTYPE = torch.float32  # CPU 用 fp32
+DEVICE = "cuda"
+DTYPE = torch.float16  # GPU 用 fp16 省显存
 
 
 def lerp(x, y, w):
@@ -70,15 +70,16 @@ class RWKV7Target:
             parts = k.split(".")
             if parts[0] == "blocks":
                 max_layer = max(max_layer, int(parts[1]))
-        self.z = z
         self.n_layer = max_layer + 1
         self.C = self.H * self.N
         self.V = z["emb.weight"].shape[0]
-        # emb 预处理：layer_norm with ln0
+        # emb 预处理：layer_norm with ln0（在 CPU 上做完再搬设备）
         z["emb.weight"] = layer_norm(z["emb.weight"], z["blocks.0.ln0.weight"], z["blocks.0.ln0.bias"])
+        # 搬到目标设备
+        self.z = {k: v.to(DEVICE) for k, v in z.items()}
         print(f"模型: L={self.n_layer} C={self.C} H={self.H} N={self.N} V={self.V}")
 
-    def zero_state(self, B, device="cpu"):
+    def zero_state(self, B, device=DEVICE):
         return [
             torch.zeros(self.n_layer, 2, B, self.C, dtype=DTYPE, device=device),  # shift state
             torch.zeros(self.n_layer, B, self.H, self.N, self.N, dtype=DTYPE, device=device),  # wkv state
@@ -187,7 +188,7 @@ def smoke_test():
     """验证 target 能加载和推理。"""
     target = RWKV7Target(WEIGHTS)
     # 简单 token 序列
-    tokens = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    tokens = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long, device=DEVICE)
     state = target.zero_state(1)
     logits, hids = target.forward(tokens, state, return_hidden_layers=[0, target.n_layer // 2, target.n_layer - 1])
     print(f"tokens shape: {tokens.shape}")

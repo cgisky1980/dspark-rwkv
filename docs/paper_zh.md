@@ -1,8 +1,10 @@
 # DSpark-RWKV：将半自回归推测解码适配于 RWKV-7
 
+> **⚠️ 勘误声明（2026-06-28）**：本文原报告的 97%+ 接受率与 3.75x 加速比已撤回。详见 §8「勘误与重做」。保留的有效贡献为：合成任务消融实验（token shift +0.435、LayerNorm +0.228）、加速比公式修正、cross-attn context 长度决定性优化发现。本文档保留原始实验描述用于历史记录，但所有「97%+ 接受率」「3.75x 加速比」相关结论均不可信。
+
 **摘要**
 
-推测解码通过解耦草稿生成与目标验证来加速大语言模型推理。近期提出的 DSpark 框架采用半自回归草稿架构（并行主干 + 顺序头）与置信度调度验证，在 DeepSeek-V4 服务系统上实现 60%–85% 的用户速度提升。然而，DSpark 原始实现面向 Transformer 类自回归 target（Qwen3 系列），其在以 RWKV-7 为代表的线性 RNN 架构上的可行性尚未被验证。本工作复现并适配 DSpark 至 RWKV-7 target，提出三项贡献：（1）将 RWKV-7 Delta Rule（DPLR）作为 DSpark 顺序头，通过 token shift 与 LayerNorm 的消融实验证明二者是必要条件；（2）发现 cross-attention 的 context 长度是决定性优化因素，单位置 hidden 到 8 位置 context 使接受率从 33% 提升至 70%；（3）通过 5 层 hidden 采样与 5000 步训练将接受率推至 97%+，并在并发批处理场景下实测达 3.75x 端到端加速比。我们同时修正了此前"单 GPU 推测解码无法加速"的错误结论，该错误源于将 target 验证误算为 vl 次独立 forward。实验代码与权重已开源。
+推测解码通过解耦草稿生成与目标验证来加速大语言模型推理。近期提出的 DSpark 框架采用半自回归草稿架构（并行主干 + 顺序头）与置信度调度验证，在 DeepSeek-V4 服务系统上实现 60%–85% 的用户速度提升。然而，DSpark 原始实现面向 Transformer 类自回归 target（Qwen3 系列），其在以 RWKV-7 为代表的线性 RNN 架构上的可行性尚未被验证。本工作复现并适配 DSpark 至 RWKV-7 target，提出三项贡献：（1）将 RWKV-7 Delta Rule（DPLR）作为 DSpark 顺序头，通过 token shift 与 LayerNorm 的消融实验证明二者是必要条件；（2）发现 cross-attention 的 context 长度是决定性优化因素，单位置 hidden 到 8 位置 context 使接受率从 33% 提升至 70%；（3）~~通过 5 层 hidden 采样与 5000 步训练将接受率推至 97%+，并在并发批处理场景下实测达 3.75x 端到端加速比~~ **（已撤回：数据泄露，见 §8）**。我们同时修正了此前"单 GPU 推测解码无法加速"的错误结论，该错误源于将 target 验证误算为 vl 次独立 forward。实验代码与权重已开源。
 
 关键词：推测解码；RWKV-7；半自回归生成；Delta Rule；并发推理
 
@@ -410,3 +412,82 @@ test/dspark_rwkv/
 2. **梯度爆炸**：未对 kk 做 L2 归一化，step 1000 时 loss 飙至 3200 万。
 3. **CPU torch 无法用 GPU**：`uv pip install torch --index-url` 被 uv run 重新解析覆盖，需在 pyproject.toml 配置 `[tool.uv.sources]`。
 4. **公式错误导致"单 GPU 无法加速"结论**：把 target 验证误算为 vl 次独立 forward，实际只需 1 次 forward [B, T=vl]。
+
+---
+
+## 8. 勘误与重做（2026-06-28）
+
+### 8.1 撤回的结论
+
+本文原版本报告了下述结论，**现已全部撤回**，因为它们建立在数据泄露或架构理解错误之上：
+
+| 原结论 | 状态 | 根因 |
+|---|---|---|
+| v3 训练接受率达 97.95% | ❌ 撤回 | 训练集与验证集使用同一份 512 条序列，无 train/val/test split |
+| 端到端并发加速比 1.56–3.75x | ❌ 撤回 | 基于上述无效接受率推导 |
+| K-state 并发验证方案 | ❌ 撤回 | 串行 draft forward 过多（406 vs 41 次 target），加速比 < 1× |
+| CUDA Graph 单点优化 | ❌ 撤回 | draft forward 降到 2.4ms，但端到端无加速 |
+| 改造 0.4B RWKV 作 drafter | ❌ 撤回 | DSpark 正确做法是从零训练独立小模型 |
+
+### 8.2 数据泄露 bug 详解
+
+`stage2_train_v3.py` 原版的关键缺陷：
+
+```python
+# 原代码（错误）：
+tokens, hids_dict = load_data()  # 一次性加载全部 512 条
+# 训练 batch: sample_batch(tokens, hids_dict, ...) 用 torch.randint(0, N=512, ...)
+# 验证 batch: sample_batch(tokens, hids_dict, ...) 同样在 N=512 中采样
+# N_eval = 512 覆盖整个训练集 —— 没有任何 held-out 数据
+```
+
+报告的 97.95% 接受率本质是 draft 模型对 512 条训练样本的**记忆**，而非对未知数据的泛化能力。
+
+### 8.3 保留的有效贡献
+
+1. **合成任务消融（§5.1）**：合成任务的 token shift（+0.435）与 LayerNorm（+0.228）消融实验不涉及数据泄露，结论保留。
+2. **加速比公式修正（§5.4.5）**：target 验证 vl 个 token 是 1 次 forward `[B, T=vl]` 而非 vl 次独立 forward，这是纯理论分析，结论保留。
+3. **cross-attn context 长度决定性优化**：在合成任务与 v1→v2 真实 target 实验中均观察到此规律，方向性结论保留（但 v3 的 97%+ 数值无效）。
+
+### 8.4 重做方案
+
+基于正确方法学重新实验：
+
+| 维度 | 原方案（已撤回） | 重做方案 |
+|---|---|---|
+| 数据集 | 自生成 512 条 | `mlabonne/open-perfectblend`（DSpark 论文同源，130 万条对话） |
+| 序列数 | 512 | 100,000（10 万条） |
+| 划分 | 无（全训练） | 80/10/10 train/val/test，完全独立 |
+| Target | RWKV-7 0.1B | RWKV-7 2.9B (g1a) |
+| Drafter | D=256, 2 层 | D=1280, 10 层, RWKV-7 head rank=512（500M 参数） |
+| Hidden 层 | [0,3,6,9,11] | [0,3,6,9,11]（保持） |
+| 训练步数 | 5000 | 20000（4 epoch） |
+| 存储 | 单文件 fp32 | 分 chunk fp16（10 文件 × 1W 条） |
+| Anchor 切片 | 随机截断 | 从 "Assistant: " 之后切片（符合推理场景） |
+
+### 8.5 初步验证结果
+
+在重做方案的小规模验证中（10 prompts × 40 tokens，K=2，α=0.5），使用 g1a-0.4B 作为 draft 基线、g1a-2.9B 作为 target：
+
+| 配置 | 接受率 |
+|---|---|
+| 修复 WKV state 维度顺序 bug 前 | 33%（输出乱码） |
+| 修复后（K=2, α=0.5） | **85.83%** |
+| 修复后（K=2, α=1.0） | 93.23% |
+
+此结果仅证明 Python 实现修复后能正常工作，**真正的加速比仍需等待 500M DSpark drafter 训练完成后评估**。当前 0.4B draft 因前向过慢（406 次 draft 迭代 vs 41 次 target）无法实现端到端加速，这正是 DSpark 半自回归架构（一次 forward 生成 K token）要解决的核心问题。
+
+### 8.6 关键 bug 修复记录
+
+1. **WKV state 维度顺序错误**：旧代码 `state[h, v, k]` 与 web-rwkv shader `state[k, v]` 转置，导致 sa 计算错误，输出乱码、接受率从 85% 跌到 33%。修复后接受率恢复正常。
+2. **w 变换公式错误**：原用 `sigmoid(w)`，正确为 `exp2(-0.875/(1+exp2(-1.443*w)))-1`（web-rwkv 版本）。
+3. **wkv_state 更新顺序**：S_kk 必须用衰减前的旧 state 计算，否则每步都重置。
+
+### 8.7 完整失败存档
+
+所有失败方案代码与报告已归档至：
+- `参考/dspark_rwkv/archive_failed/`（16 个失败报告）
+- `dspark-rwkv-repo/archive/stage9_13_failed/`（43 个 stage9-13 代码）
+- `dspark-rwkv-repo/docs/archive_failed/`（7 个失败报告）
+
+总结见 `参考/dspark_rwkv/失败存档总结.md`。

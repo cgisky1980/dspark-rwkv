@@ -1,18 +1,24 @@
-"""阶段2 优化B：生成 5 层 target hidden 的训练数据（layer 0/3/6/9/11）。"""
+"""阶段2：生成 5 层 target hidden 的训练数据（layer 0/3/6/9/11）。
+
+修复数据泄露：生成后按 80/10/10 划分 train/val/test，保存三个独立文件。
+Target: RWKV-7 2.9B（GPU fp16）。
+"""
 import torch
 from pathlib import Path
 from stage2_target import RWKV7Target, WEIGHTS
 
-N_SEQ = 512
+N_SEQ = 2048
 T_LEN = 32
 TARGET_LAYERS = [0, 3, 6, 9, 11]  # 5 层
-BATCH = 64
-OUT = Path(__file__).parent / "data" / "stage2_train_5layer.pt"
+BATCH = 16  # 2.9B 模型显存较大，batch 降到 16
+SPLIT = (0.8, 0.1, 0.1)  # train / val / test
+SEED = 42
+DATA_DIR = Path(__file__).parent / "data"
+
 
 def main():
     target = RWKV7Target(WEIGHTS)
-    target.z = {k: v.to("cuda") for k, v in target.z.items()}
-    print("target 已搬到 GPU")
+    print("target 已在 GPU")
 
     all_tokens = []
     all_hids = {l: [] for l in TARGET_LAYERS}
@@ -39,16 +45,30 @@ def main():
         n_done += B
         print(f"  完成 {n_done}/{N_SEQ}")
 
-    all_tokens = torch.cat(all_tokens, dim=0)
-    data = {"tokens": all_tokens}
-    for l in TARGET_LAYERS:
-        data[f"hidden_{l}"] = torch.cat(all_hids[l], dim=0)
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(data, OUT)
-    print(f"\n保存到 {OUT}")
-    print(f"tokens: {all_tokens.shape}")
-    for l in TARGET_LAYERS:
-        print(f"hidden_{l}: {data[f'hidden_{l}'].shape}")
+    all_tokens = torch.cat(all_tokens, dim=0)  # [N_SEQ, T_LEN+1]
+    all_hids_cat = {l: torch.cat(all_hids[l], dim=0) for l in TARGET_LAYERS}  # [N_SEQ, T_LEN, C]
+
+    # 固定 seed 划分 train/val/test，保证可复现
+    g = torch.Generator().manual_seed(SEED)
+    perm = torch.randperm(N_SEQ, generator=g)
+    n_train = int(N_SEQ * SPLIT[0])
+    n_val = int(N_SEQ * SPLIT[1])
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for name, idx in [("train", idx_train), ("val", idx_val), ("test", idx_test)]:
+        data = {"tokens": all_tokens[idx]}
+        for l in TARGET_LAYERS:
+            data[f"hidden_{l}"] = all_hids_cat[l][idx]
+        out = DATA_DIR / f"stage2_{name}_5layer.pt"
+        torch.save(data, out)
+        print(f"保存 {name}: {len(idx)} 条 -> {out}")
+        print(f"  tokens: {data['tokens'].shape}")
+        for l in TARGET_LAYERS:
+            print(f"  hidden_{l}: {data[f'hidden_{l}'].shape}")
+
 
 if __name__ == "__main__":
     main()

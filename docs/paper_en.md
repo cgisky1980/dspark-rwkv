@@ -1,8 +1,10 @@
 # DSpark-RWKV: Adapting Semi-Autoregressive Speculative Decoding to RWKV-7
 
+> **⚠️ Errata (2026-06-28)**: The previously reported 97%+ acceptance rate and 3.75x speedup have been retracted. See §8 "Errata and Rework". Retained contributions: synthetic-task ablation (token shift +0.435, LayerNorm +0.228), speedup formula correction, cross-attn context length decisive optimization. This document retains original experimental descriptions for historical record, but all conclusions referencing "97%+ acceptance" or "3.75x speedup" are invalid.
+
 **Abstract**
 
-Speculative decoding accelerates Large Language Model (LLM) inference by decoupling draft generation from target verification. The recent DSpark framework employs a semi-autoregressive draft architecture (parallel backbone + sequential head) with confidence-scheduled verification, achieving 60%–85% per-user speedup on the DeepSeek-V4 serving system. However, the original DSpark implementation targets Transformer-based autoregressive models (Qwen3 series), and its feasibility on linear RNN architectures such as RWKV-7 remains unverified. This work reproduces and adapts DSpark to RWKV-7 target, making three contributions: (1) we adopt the RWKV-7 Delta Rule (DPLR) as the DSpark sequential head, and through ablation studies demonstrate that token shift and LayerNorm are necessary conditions; (2) we identify cross-attention context length as the decisive optimization factor—extending from single-position hidden to 8-position context boosts acceptance rate from 33% to 70%; (3) by sampling 5 hidden layers and training for 5000 steps, we push the acceptance rate to 97%+, and achieve 3.75x end-to-end speedup in concurrent batched inference. We also correct a prior erroneous conclusion that "speculative decoding cannot accelerate on single GPU", which stemmed from mistakenly computing target verification as vl independent forwards. Experimental code and weights are open-sourced.
+Speculative decoding accelerates Large Language Model (LLM) inference by decoupling draft generation from target verification. The recent DSpark framework employs a semi-autoregressive draft architecture (parallel backbone + sequential head) with confidence-scheduled verification, achieving 60%–85% per-user speedup on the DeepSeek-V4 serving system. However, the original DSpark implementation targets Transformer-based autoregressive models (Qwen3 series), and its feasibility on linear RNN architectures such as RWKV-7 remains unverified. This work reproduces and adapts DSpark to RWKV-7 target, making three contributions: (1) we adopt the RWKV-7 Delta Rule (DPLR) as the DSpark sequential head, and through ablation studies demonstrate that token shift and LayerNorm are necessary conditions; (2) we identify cross-attention context length as the decisive optimization factor—extending from single-position hidden to 8-position context boosts acceptance rate from 33% to 70%; (3) ~~by sampling 5 hidden layers and training for 5000 steps, we push the acceptance rate to 97%+, and achieve 3.75x end-to-end speedup in concurrent batched inference~~ **(retracted: data leakage, see §8)**. We also correct a prior erroneous conclusion that "speculative decoding cannot accelerate on single GPU", which stemmed from mistakenly computing target verification as vl independent forwards. Experimental code and weights are open-sourced.
 
 Keywords: Speculative Decoding; RWKV-7; Semi-Autoregressive Generation; Delta Rule; Concurrent Inference
 
@@ -410,3 +412,82 @@ To prevent future repetition, we document tried failed approaches:
 2. **Gradient explosion**: Without L2 normalization of kk, loss spiked to 32 million at step 1000.
 3. **CPU torch cannot use GPU**: `uv pip install torch --index-url` was overridden by uv run re-resolution; needed `[tool.uv.sources]` in pyproject.toml.
 4. **Formula error causing "single GPU cannot accelerate" conclusion**: Treated target verification as vl independent forwards, when actually only 1 forward [B, T=vl] is needed.
+
+---
+
+## 8. Errata and Rework (2026-06-28)
+
+### 8.1 Retracted Conclusions
+
+The original version of this paper reported the following conclusions, **all now retracted** because they were built on data leakage or architectural misunderstanding:
+
+| Original Conclusion | Status | Root Cause |
+|---|---|---|
+| v3 training acceptance reached 97.95% | ❌ Retracted | Training and validation used the same 512 sequences; no train/val/test split |
+| End-to-end concurrent speedup 1.56–3.75x | ❌ Retracted | Derived from the invalid acceptance rate above |
+| K-state concurrent verification scheme | ❌ Retracted | Excessive serial draft forwards (406 vs 41 target iterations), speedup < 1× |
+| CUDA Graph single-point optimization | ❌ Retracted | Draft forward reduced to 2.4ms, but no end-to-end speedup |
+| Modifying 0.4B RWKV as drafter | ❌ Retracted | Correct DSpark design is an independent small model trained from scratch |
+
+### 8.2 Data Leakage Bug Detail
+
+The key flaw in the original `stage2_train_v3.py`:
+
+```python
+# Original code (buggy):
+tokens, hids_dict = load_data()  # loads all 512 sequences at once
+# Training batch: sample_batch(tokens, hids_dict, ...) uses torch.randint(0, N=512, ...)
+# Validation batch: sample_batch(tokens, hids_dict, ...) also samples from N=512
+# N_eval = 512 covers the entire training set — no held-out data
+```
+
+The reported 97.95% acceptance was essentially the draft model's **memorization** of the 512 training samples, not generalization to unseen data.
+
+### 8.3 Retained Valid Contributions
+
+1. **Synthetic-task ablation (§5.1)**: The token shift (+0.435) and LayerNorm (+0.228) ablation on synthetic tasks does not involve data leakage; conclusions retained.
+2. **Speedup formula correction (§5.4.5)**: Target verification of vl tokens is 1 forward `[B, T=vl]` rather than vl independent forwards; this is pure theoretical analysis, conclusion retained.
+3. **Cross-attn context length decisive optimization**: Observed in both synthetic tasks and v1→v2 real-target experiments; directional conclusion retained (but v3's 97%+ numerical result is invalid).
+
+### 8.4 Rework Plan
+
+Re-experimenting with correct methodology:
+
+| Dimension | Original (Retracted) | Rework |
+|---|---|---|
+| Dataset | Self-generated 512 sequences | `mlabonne/open-perfectblend` (DSpark paper source, 1.3M conversations) |
+| Sequence count | 512 | 100,000 |
+| Split | None (all training) | 80/10/10 train/val/test, fully independent |
+| Target | RWKV-7 0.1B | RWKV-7 2.9B (g1a) |
+| Drafter | D=256, 2 layers | D=1280, 10 layers, RWKV-7 head rank=512 (500M params) |
+| Hidden layers | [0,3,6,9,11] | [0,3,6,9,11] (unchanged) |
+| Training steps | 5000 | 20000 (4 epochs) |
+| Storage | Single fp32 file | Chunked fp16 (10 files × 10K sequences) |
+| Anchor slicing | Random truncation | After "Assistant: " (matches inference scenario) |
+
+### 8.5 Preliminary Validation Results
+
+In a small-scale validation of the rework (10 prompts × 40 tokens, K=2, α=0.5), using g1a-0.4B as draft baseline and g1a-2.9B as target:
+
+| Configuration | Acceptance Rate |
+|---|---|
+| Before fixing WKV state dimension order bug | 33% (garbled output) |
+| After fix (K=2, α=0.5) | **85.83%** |
+| After fix (K=2, α=1.0) | 93.23% |
+
+This result only confirms that the Python implementation works correctly after bug fixes. **The true speedup still requires the 500M DSpark drafter to finish training before evaluation.** The current 0.4B draft cannot achieve end-to-end speedup due to slow forward passes (406 draft iterations vs 41 target), which is exactly the problem the DSpark semi-autoregressive architecture (one forward generating K tokens) is designed to solve.
+
+### 8.6 Key Bug Fixes
+
+1. **WKV state dimension order error**: Old code `state[h, v, k]` was transposed from web-rwkv shader's `state[k, v]`, causing sa computation errors, garbled output, and acceptance dropping from 85% to 33%. After fix, acceptance returned to normal.
+2. **w transform formula error**: Originally used `sigmoid(w)`; correct is `exp2(-0.875/(1+exp2(-1.443*w)))-1` (web-rwkv version).
+3. **wkv_state update order**: S_kk must be computed using the old state before decay, otherwise the state resets every step.
+
+### 8.7 Full Failure Archive
+
+All failed scheme code and reports have been archived to:
+- `参考/dspark_rwkv/archive_failed/` (16 failure reports)
+- `dspark-rwkv-repo/archive/stage9_13_failed/` (43 stage9-13 code files)
+- `dspark-rwkv-repo/docs/archive_failed/` (7 failure reports)
+
+Summary in `参考/dspark_rwkv/失败存档总结.md`.
