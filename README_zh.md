@@ -42,17 +42,9 @@
 ```
 dspark-rwkv/
 ├── pyproject.toml                # 依赖配置（torch cu124）
-├── stage1_experiment.py          # 阶段1：合成任务（单/双 key + 消融）
-├── stage2_target.py              # RWKV-7 target（纯 PyTorch）
-├── stage2_gen_data.py            # 3 层 hidden 数据生成（旧）
-├── stage2_gen_data_5layer.py     # 5 层 hidden 数据生成（旧，无 split）
-├── stage2_gen_data_fast.py       # 分 chunk 数据生成（fp16，10W 条，train/val/test split）
-├── stage2_train.py               # v1 训练（cross-attn 单位置）
-├── stage2_train_v2.py            # v2 优化（8 位置 context + 置信度 BCE）
-├── stage2_train_v3.py            # v3 训练（chunked loading，500M drafter）
-├── stage3_schedule.py            # 离线调度评估（v1 数据）
-├── stage3_schedule_v2.py         # 离线调度评估（v3 数据）
-├── stage4_concurrent.py          # 阶段4：并发实测
+├── stage2_target.py              # RWKV-7 target（纯 PyTorch，2.9B g1a）
+├── stage2_gen_data_fast.py      # 分 chunk 数据生成（fp16，10W 条，open-perfectblend）
+├── stage2_train_v3.py            # v3 训练（chunked loading，500M drafter，20000 步）
 ├── rwkv_tokenizer.py             # RWKV BPE 分词器
 ├── rwkv_vocab_v20230424.txt      # RWKV 词表
 ├── cuda/                         # CUDA kernels（WKV fp16/fp32）
@@ -63,7 +55,8 @@ dspark-rwkv/
 │   ├── stage2_benchmark.py
 │   ├── stage2_verify_target.py
 │   ├── stage4_e2e_batch1_buggy.py
-│   └── stage9_13_failed/         # K-state 方案（加速比 < 1×，已归档）
+│   ├── stage9_13_failed/         # K-state 方案（加速比 < 1×，已归档）
+│   └── legacy/                   # 早期版本（已被根目录脚本取代）
 ├── docs/                         # 文档与论文
 │   ├── paper_zh.md               # 中文论文
 │   ├── paper_en.md               # 英文论文

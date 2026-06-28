@@ -42,17 +42,9 @@ See [`参考/dspark_rwkv/失败存档总结.md`](../参考/dspark_rwkv/失败存
 ```
 dspark-rwkv/
 ├── pyproject.toml                # Dependency config (torch cu124)
-├── stage1_experiment.py          # Stage 1: synthetic tasks (single/double key + ablation)
-├── stage2_target.py              # RWKV-7 target (pure PyTorch)
-├── stage2_gen_data.py            # 3-layer hidden data generation (legacy)
-├── stage2_gen_data_5layer.py     # 5-layer hidden data generation (legacy, no split)
-├── stage2_gen_data_fast.py       # Chunked data generation (fp16, 100K sequences, train/val/test split)
-├── stage2_train.py               # v1 training (cross-attn single position)
-├── stage2_train_v2.py            # v2 optimization (8-position context + confidence BCE)
-├── stage2_train_v3.py            # v3 training (chunked loading, 500M drafter)
-├── stage3_schedule.py            # Offline scheduling evaluation (v1 data)
-├── stage3_schedule_v2.py         # Offline scheduling evaluation (v3 data)
-├── stage4_concurrent.py          # Stage 4: concurrent measurement
+├── stage2_target.py              # RWKV-7 target (pure PyTorch, 2.9B g1a)
+├── stage2_gen_data_fast.py       # Chunked data generation (fp16, 100K sequences, open-perfectblend)
+├── stage2_train_v3.py            # v3 training (chunked loading, 500M drafter, 20000 steps)
 ├── rwkv_tokenizer.py             # RWKV BPE tokenizer
 ├── rwkv_vocab_v20230424.txt      # RWKV vocab
 ├── cuda/                         # CUDA kernels (WKV fp16/fp32)
@@ -63,7 +55,8 @@ dspark-rwkv/
 │   ├── stage2_benchmark.py
 │   ├── stage2_verify_target.py
 │   ├── stage4_e2e_batch1_buggy.py
-│   └── stage9_13_failed/          # K-state scheme (speedup < 1×, archived)
+│   ├── stage9_13_failed/         # K-state scheme (speedup < 1×, archived)
+│   └── legacy/                   # Early versions superseded by current root scripts
 ├── docs/                         # Documentation and papers
 │   ├── paper_zh.md               # Chinese paper
 │   ├── paper_en.md               # English paper
